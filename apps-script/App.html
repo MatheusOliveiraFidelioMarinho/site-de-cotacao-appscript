@@ -1,0 +1,1138 @@
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Constantes
+  // ---------------------------------------------------------------------------
+
+  const ROTULO = {
+    EM_COTACAO: 'Em cotação',
+    AGUARDANDO_APROVACAO: 'Aguardando aprovação',
+    APROVADO: 'Aprovado',
+    REPROVADO: 'Reprovado',
+    COMPRADO: 'Comprado',
+    ENTREGUE: 'Entregue',
+    CANCELADO: 'Cancelado',
+  };
+  const COR = {
+    EM_COTACAO: 'cotacao', AGUARDANDO_APROVACAO: 'aguardando', APROVADO: 'aprovado', REPROVADO: 'reprovado',
+    COMPRADO: 'comprado', ENTREGUE: 'entregue', CANCELADO: 'cancelado',
+  };
+  // Ordem dos itens dentro do projeto: o que pede ação primeiro.
+  const ORDEM = ['AGUARDANDO_APROVACAO', 'EM_COTACAO', 'APROVADO', 'COMPRADO', 'ENTREGUE', 'REPROVADO', 'CANCELADO'];
+  const CHIPS = [
+    ['AGUARDANDO_APROVACAO', 'p/ aprovar'], ['EM_COTACAO', 'em cotação'], ['APROVADO', 'a comprar'],
+    ['COMPRADO', 'a receber'], ['ENTREGUE', 'entregues'],
+  ];
+  const FILTROS = [
+    ['ANDAMENTO', 'Em andamento'], ['AGUARDANDO_APROVACAO', 'Para aprovar'], ['EM_COTACAO', 'Em cotação'],
+    ['APROVADO', 'A comprar'], ['COMPRADO', 'A receber'], ['ENTREGUE', 'Entregues'],
+    ['ENCERRADOS', 'Reprovados / cancelados'], ['TODOS', 'Todos'],
+  ];
+  const EM_ANDAMENTO = ['EM_COTACAO', 'AGUARDANDO_APROVACAO', 'APROVADO', 'COMPRADO'];
+  const COTAVEL = ['EM_COTACAO', 'AGUARDANDO_APROVACAO'];
+  const APROVADOS = ['APROVADO', 'COMPRADO', 'ENTREGUE'];
+  const CANAIS = ['Site / loja online', 'Loja física', 'Representante / vendedor', 'WhatsApp', 'Telefone', 'E-mail', 'Estoque próprio', 'Outro'];
+  const PAGAMENTOS = ['A definir', 'PIX', 'Boleto', 'Cartão de crédito', 'Cartão de débito', 'Transferência bancária', 'Faturado', 'Dinheiro', 'Não se aplica (estoque)', 'Outro'];
+  const UNIDADES = ['un', 'pç', 'cx', 'm', 'm²', 'm³', 'kg', 'l', 'rolo', 'par', 'kit', 'jogo', 'h', 'serviço'];
+  const ATUALIZAR_A_CADA_MS = 45000;
+  const CHAVE_RECOLHIDOS = 'compras-recolhidos';
+
+  const estado = {
+    dados: null,
+    idx: null,
+    filtro: { status: 'ANDAMENTO', busca: '', encerrados: false },
+    aberto: null,
+    selecionada: {},       // itemId -> cotacaoId escolhida na linha/gaveta
+    marcados: new Set(),   // itens marcados para ação em lote
+    recolhidos: new Set(lerLocal(CHAVE_RECOLHIDOS, [])),
+    ocupado: false,
+  };
+
+  const $ = (sel, raiz) => (raiz || document).querySelector(sel);
+  const $$ = (sel, raiz) => Array.prototype.slice.call((raiz || document).querySelectorAll(sel));
+
+  // ---------------------------------------------------------------------------
+  // Utilidades
+  // ---------------------------------------------------------------------------
+
+  function lerLocal(chave, padrao) {
+    try { return JSON.parse(localStorage.getItem(chave)) || padrao; } catch (e) { return padrao; }
+  }
+  function gravarLocal(chave, valor) {
+    try { localStorage.setItem(chave, JSON.stringify(valor)); } catch (e) { /* sem armazenamento: tudo bem */ }
+  }
+
+  function api(nome) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    return new Promise((ok, falha) => {
+      google.script.run
+        .withSuccessHandler(ok)
+        .withFailureHandler(e => falha(new Error(String((e && e.message) || e).replace(/^(Error|Exception):\s*/, ''))))
+        [nome].apply(null, args);
+    });
+  }
+
+  function esc(v) {
+    return String(v === undefined || v === null ? '' : v)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  const fmtMoeda = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
+  const moeda = v => fmtMoeda.format(Number(v) || 0);
+  const numero = v => (Number(v) || 0).toLocaleString('pt-BR', { maximumFractionDigits: 3 });
+
+  function data(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString('pt-BR');
+  }
+  function dataHora(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  }
+  function paraInputData(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+
+  /** Aceita "1.234,56", "1234.56", "R$ 50" etc. */
+  function lerValor(texto) {
+    let s = String(texto || '').replace(/[R$\s]/g, '');
+    if (!s) return NaN;
+    if (s.indexOf(',') >= 0) s = s.replace(/\./g, '').replace(',', '.');
+    else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+    return Number(s);
+  }
+  function valorParaInput(v) {
+    return v === '' || v === null || v === undefined ? '' : String(v).replace('.', ',');
+  }
+
+  function semAcento(s) {
+    return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  }
+
+  function linkSeguro(url) {
+    const u = String(url || '').trim();
+    if (!u) return '';
+    if (/^https?:\/\//i.test(u)) return u;
+    if (/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(u)) return 'https://' + u;
+    return '';
+  }
+
+  function badge(status) {
+    const c = COR[status] || 'cancelado';
+    return '<span class="badge" style="--c:var(--st-' + c + ');--bg:var(--st-' + c + '-bg)">' + esc(ROTULO[status] || status) + '</span>';
+  }
+
+  function opcoes(lista, atual, vazio) {
+    return (vazio !== undefined ? '<option value="">' + esc(vazio) + '</option>' : '') +
+      lista.map(v => '<option' + (v === atual ? ' selected' : '') + '>' + esc(v) + '</option>').join('');
+  }
+
+  function toast(texto, tipo) {
+    const el = document.createElement('div');
+    el.className = 'toast' + (tipo === 'erro' ? ' erro' : '');
+    el.textContent = texto;
+    el.style.whiteSpace = 'pre-line';
+    $('#toasts').appendChild(el);
+    setTimeout(() => el.remove(), tipo === 'erro' ? 8000 : 3500);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dados
+  // ---------------------------------------------------------------------------
+
+  const eu = () => estado.dados.usuario;
+  const souAprovador = () => eu().papel === 'APROVADOR';
+  const podeGerenciar = item => souAprovador() || item.CriadoPor === eu().email;
+
+  function nomeDe(email) {
+    const u = estado.dados.usuarios.find(x => x.email === String(email || '').toLowerCase());
+    return u ? u.nome : (email || '—');
+  }
+
+  function indexar() {
+    const idx = { cotacoes: {}, comentarios: {}, historico: {}, itens: {}, porProjeto: {} };
+    const add = (mapa, chave, v) => { (mapa[chave] = mapa[chave] || []).push(v); };
+    estado.dados.itens.forEach(i => { idx.itens[i.ID] = i; add(idx.porProjeto, String(i.Projeto), i); });
+    estado.dados.cotacoes.forEach(c => add(idx.cotacoes, c.ItemID, c));
+    estado.dados.comentarios.forEach(c => add(idx.comentarios, c.ItemID, c));
+    estado.dados.historico.forEach(h => add(idx.historico, h.ItemID, h));
+    Object.keys(idx.cotacoes).forEach(k => idx.cotacoes[k].sort((a, b) => (Number(a.ValorTotal) || 0) - (Number(b.ValorTotal) || 0)));
+    estado.idx = idx;
+
+    // Limpa escolhas/marcas que não valem mais.
+    Object.keys(estado.selecionada).forEach(id => {
+      if (!cotacoesDe(id).some(c => c.ID === estado.selecionada[id])) delete estado.selecionada[id];
+    });
+    estado.marcados.forEach(id => { if (!idx.itens[id] || !podeMarcar(idx.itens[id])) estado.marcados.delete(id); });
+  }
+
+  const cotacoesDe = id => estado.idx.cotacoes[id] || [];
+  const comentariosDe = id => estado.idx.comentarios[id] || [];
+  const historicoDe = id => estado.idx.historico[id] || [];
+
+  /** Cotação "da vez" do item: a aprovada, a escolhida na tela ou a mais barata. */
+  function cotacaoAtual(item) {
+    const cs = cotacoesDe(item.ID);
+    if (APROVADOS.indexOf(item.Status) >= 0) return cs.find(c => c.ID === item.CotacaoAprovadaID) || null;
+    return cs.find(c => c.ID === estado.selecionada[item.ID]) || cs[0] || null;
+  }
+
+  function valorItem(item) {
+    if (APROVADOS.indexOf(item.Status) >= 0) return Number(item.ValorAprovado) || 0;
+    const c = cotacaoAtual(item);
+    return c ? Number(c.ValorTotal) || 0 : null;
+  }
+
+  function naoLidas(item) {
+    const lido = estado.dados.lidos[item.ID] || '';
+    return comentariosDe(item.ID).filter(c => c.Autor !== eu().email && String(c.CriadoEm) > lido).length;
+  }
+
+  function ultimaAtividade(item) {
+    const datas = [item.AtualizadoEm || item.CriadoEm].concat(comentariosDe(item.ID).map(c => c.CriadoEm));
+    return datas.filter(Boolean).sort().pop() || '';
+  }
+
+  /** Projetos da planilha + nomes usados em itens que não estejam na lista. */
+  function listaProjetos() {
+    const porNome = {};
+    estado.dados.projetos.forEach(p => { porNome[String(p.Nome)] = p; });
+    Object.keys(estado.idx.porProjeto).forEach(n => {
+      if (!porNome[n]) porNome[n] = { ID: '', Nome: n, Cliente: '', Ativo: true };
+    });
+    return Object.keys(porNome).map(n => porNome[n]);
+  }
+
+  function podeMarcar(item) {
+    if (!cotacoesDe(item.ID).length) return false;
+    return souAprovador() ? COTAVEL.indexOf(item.Status) >= 0 : item.Status === 'EM_COTACAO';
+  }
+
+  function aplicar(dados) {
+    estado.dados = dados;
+    indexar();
+    renderPainel();
+    if (estado.aberto) renderDetalhe();
+  }
+
+  function executar(promessa, sucesso) {
+    estado.ocupado = true;
+    document.body.style.cursor = 'progress';
+    $$('#gaveta button, #modal button, #projetos button, #selecao button').forEach(b => { b.disabled = true; });
+    return promessa
+      .then(dados => {
+        aplicar(dados);
+        if (sucesso) toast(sucesso);
+        return dados;
+      })
+      .catch(e => {
+        toast(e.message, 'erro');
+        // Em lote, parte pode ter sido salva: recarrega para mostrar o estado real.
+        api('getDados').then(aplicar).catch(() => {});
+        throw e;
+      })
+      .finally(() => {
+        estado.ocupado = false;
+        document.body.style.cursor = '';
+        $$('#gaveta button, #modal button, #projetos button, #selecao button').forEach(b => { b.disabled = false; });
+        renderPainel();
+        if (estado.aberto) renderDetalhe();
+      });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Painel: projetos com seus itens
+  // ---------------------------------------------------------------------------
+
+  function passaStatus(item) {
+    const f = estado.filtro.status;
+    if (f === 'TODOS') return true;
+    if (f === 'ANDAMENTO') return EM_ANDAMENTO.indexOf(item.Status) >= 0;
+    if (f === 'ENCERRADOS') return item.Status === 'REPROVADO' || item.Status === 'CANCELADO';
+    return item.Status === f;
+  }
+
+  function textoBusca(item) {
+    return semAcento([item.ID, item.Descricao, item.Observacao, nomeDe(item.CriadoPor), item.NumeroPedido]
+      .concat(cotacoesDe(item.ID).map(c => c.Fornecedor)).join(' '));
+  }
+
+  function renderPainel() {
+    if (!estado.dados) return;
+    const d = estado.dados;
+    const u = eu();
+    $('#usuario').innerHTML = esc(u.nome) + '<small>' + (u.papel === 'APROVADOR' ? 'APROVADOR' : 'COMPRADOR') + '</small>';
+
+    $('#f-status').innerHTML = FILTROS.map(o =>
+      '<option value="' + o[0] + '"' + (o[0] === estado.filtro.status ? ' selected' : '') + '>' + esc(o[1]) + '</option>').join('');
+
+    // Aviso do topo
+    const aguardando = d.itens.filter(i => i.Status === 'AGUARDANDO_APROVACAO').length;
+    const aComprar = d.itens.filter(i => i.Status === 'APROVADO').length;
+    let aviso = '';
+    if (souAprovador() && aguardando && estado.filtro.status !== 'AGUARDANDO_APROVACAO') {
+      aviso = '<div class="aviso"><strong>' + aguardando + '</strong> ' +
+        (aguardando === 1 ? 'item aguardando sua aprovação' : 'itens aguardando sua aprovação') +
+        '<button class="btn btn-sm" type="button" data-ir="AGUARDANDO_APROVACAO">Mostrar só eles</button></div>';
+    } else if (!souAprovador() && aComprar && estado.filtro.status !== 'APROVADO') {
+      aviso = '<div class="aviso" style="background:var(--st-aprovado-bg);border-color:#cfe3a6;color:#36550d"><strong>' + aComprar + '</strong> ' +
+        (aComprar === 1 ? 'item aprovado esperando a compra' : 'itens aprovados esperando a compra') +
+        '<button class="btn btn-sm" type="button" data-ir="APROVADO">Mostrar só eles</button></div>';
+    }
+    $('#aviso').innerHTML = aviso;
+
+    // Projetos visíveis
+    const termo = semAcento(estado.filtro.busca).trim();
+    const filtroPadrao = estado.filtro.status === 'ANDAMENTO' && !termo;
+    const blocos = listaProjetos()
+      .filter(p => p.Ativo || estado.filtro.encerrados)
+      .map(p => {
+        const todos = estado.idx.porProjeto[String(p.Nome)] || [];
+        const nomeBate = termo && semAcento(p.Nome + ' ' + p.Cliente).indexOf(termo) >= 0;
+        const visiveis = todos.filter(i => passaStatus(i) && (!termo || nomeBate || textoBusca(i).indexOf(termo) >= 0));
+        const pendentes = todos.filter(i => i.Status === 'AGUARDANDO_APROVACAO').length;
+        const ativ = todos.map(ultimaAtividade).concat([p.CriadoEm || '']).sort().pop();
+        // Na visão padrão todo projeto ativo aparece (para poder lançar itens); com filtro, só os que têm resultado.
+        return { p, todos, visiveis, pendentes, ativ, mostrar: filtroPadrao || nomeBate || visiveis.length > 0 };
+      })
+      .filter(b => b.mostrar)
+      .sort((a, b) => (souAprovador() ? (b.pendentes > 0) - (a.pendentes > 0) : 0) || String(b.ativ).localeCompare(String(a.ativ)));
+
+    if (!blocos.length) {
+      $('#projetos').innerHTML = '<div class="vazio">' + (d.projetos.length || d.itens.length
+        ? 'Nada encontrado com esses filtros.'
+        : 'Nenhum projeto ainda. Clique em <strong>+ Novo projeto</strong> para começar.') + '</div>';
+    } else {
+      $('#projetos').innerHTML = blocos.map(blocoProjeto).join('');
+    }
+    renderSelecao();
+  }
+
+  function blocoProjeto(b) {
+    const p = b.p;
+    const nome = String(p.Nome);
+    const ativos = b.todos.filter(i => i.Status !== 'REPROVADO' && i.Status !== 'CANCELADO');
+    const soma = lista => lista.reduce((t, i) => t + (valorItem(i) || 0), 0);
+    const emCotacao = soma(ativos.filter(i => COTAVEL.indexOf(i.Status) >= 0));
+    const aprovado = soma(ativos.filter(i => APROVADOS.indexOf(i.Status) >= 0));
+    const comprado = soma(ativos.filter(i => i.Status === 'COMPRADO' || i.Status === 'ENTREGUE'));
+    const recolhido = estado.recolhidos.has(nome);
+    const novas = b.todos.reduce((t, i) => t + naoLidas(i), 0);
+
+    const chips = CHIPS.map(c => {
+      const n = b.todos.filter(i => i.Status === c[0]).length;
+      if (!n) return '';
+      const cor = COR[c[0]];
+      return '<span class="chip" style="--c:var(--st-' + cor + ');--bg:var(--st-' + cor + '-bg)">' + n + ' ' + c[1] + '</span>';
+    }).join('');
+
+    const cls = ['projeto'];
+    if (b.pendentes && souAprovador()) cls.push('pendente');
+    if (!p.Ativo) cls.push('encerrado');
+    if (recolhido) cls.push('recolhido');
+
+    return '<section class="' + cls.join(' ') + '" data-projeto="' + esc(nome) + '">' +
+      '<header class="pj-cab" data-alternar>' +
+      '<span class="seta">▾</span>' +
+      '<div class="pj-titulo"><h2>' + esc(nome) + '</h2>' + (!p.Ativo ? ' <span class="tag tag-baixa">ENCERRADO</span>' : '') +
+      (novas ? ' <span class="msgs nova"><span class="ponto"></span> ' + novas + '</span>' : '') +
+      '<span class="item-sub">' + (p.Cliente ? esc(p.Cliente) + ' · ' : '') + b.todos.length + (b.todos.length === 1 ? ' item' : ' itens') + '</span></div>' +
+      '<div class="chips">' + chips + '</div>' +
+      '<dl class="pj-valores">' +
+      '<div><dt>Em cotação</dt><dd>' + moeda(emCotacao) + '</dd></div>' +
+      '<div><dt>Aprovado</dt><dd>' + moeda(aprovado) + '</dd></div>' +
+      '<div><dt>Comprado</dt><dd>' + moeda(comprado) + '</dd></div>' +
+      '</dl>' +
+      '<div class="pj-botoes">' +
+      (p.Ativo ? '<button class="btn btn-sm" type="button" data-acao="add-itens">+ Itens</button>' : '') +
+      (souAprovador() && p.ID ? '<button class="btn-link" type="button" data-acao="' + (p.Ativo ? 'encerrar' : 'reabrir-projeto') + '">' + (p.Ativo ? 'Encerrar' : 'Reabrir') + '</button>' : '') +
+      '</div></header>' +
+      '<div class="pj-corpo">' + tabelaItens(b.visiveis, b.todos.length) + '</div>' +
+      '</section>';
+  }
+
+  function tabelaItens(itens, total) {
+    if (!itens.length) {
+      return '<div class="pj-vazio">' + (total ? 'Nenhum item com esse filtro.' : 'Nenhum item ainda. Clique em <strong>+ Itens</strong> para lançar o que precisa comprar.') + '</div>';
+    }
+    const ordenados = itens.slice().sort((a, b) =>
+      (ORDEM.indexOf(a.Status) - ORDEM.indexOf(b.Status)) || String(a.ID).localeCompare(String(b.ID)));
+    const marcaveis = ordenados.filter(podeMarcar);
+    const todosMarcados = marcaveis.length && marcaveis.every(i => estado.marcados.has(i.ID));
+    const soma = ordenados.filter(i => i.Status !== 'REPROVADO' && i.Status !== 'CANCELADO')
+      .reduce((t, i) => t + (valorItem(i) || 0), 0);
+
+    return '<table class="tabela"><thead><tr>' +
+      '<th class="col-check">' + (marcaveis.length ? '<input type="checkbox" data-marcar-todos' + (todosMarcados ? ' checked' : '') + ' aria-label="Marcar todos">' : '') + '</th>' +
+      '<th>Nº</th><th>Item</th><th>Cotação</th><th>Valor</th><th>Status</th><th></th><th></th>' +
+      '</tr></thead><tbody>' + ordenados.map(linhaItem).join('') + '</tbody>' +
+      '<tfoot><tr><td></td><td colspan="3">Total</td><td class="num">' + moeda(soma) + '</td><td colspan="3"></td></tr></tfoot></table>';
+  }
+
+  function linhaItem(i) {
+    const cs = cotacoesDe(i.ID);
+    const atual = cotacaoAtual(i);
+    const valor = valorItem(i);
+    const marcado = estado.marcados.has(i.ID);
+    const novas = naoLidas(i);
+    const nMsg = comentariosDe(i.ID).length;
+    const urg = i.Urgencia === 'ALTA' ? '<span class="tag tag-alta">URGENTE</span>' : '';
+
+    let cotacao;
+    if (!cs.length) {
+      cotacao = COTAVEL.indexOf(i.Status) >= 0 ? '<span class="forn-sub">sem cotação</span>' : '—';
+    } else if (COTAVEL.indexOf(i.Status) >= 0 && cs.length > 1) {
+      cotacao = '<select class="campo sel-cot" data-escolher aria-label="Cotação">' + cs.map((c, k) =>
+        '<option value="' + esc(c.ID) + '"' + (atual && c.ID === atual.ID ? ' selected' : '') + '>' +
+        esc(c.Fornecedor) + ' — ' + moeda(c.ValorTotal) + (k === 0 ? ' (menor)' : '') + '</option>').join('') + '</select>';
+    } else if (atual) {
+      cotacao = esc(atual.Fornecedor) + '<div class="forn-sub">' + esc(atual.FormaPagamento) + (atual.CondicaoPagamento ? ' · ' + esc(atual.CondicaoPagamento) : '') + '</div>';
+    } else {
+      cotacao = '—';
+    }
+
+    return '<tr data-id="' + esc(i.ID) + '"' + (marcado ? ' class="marcado"' : '') + '>' +
+      '<td class="col-check">' + (podeMarcar(i) ? '<input type="checkbox" data-marcar' + (marcado ? ' checked' : '') + ' aria-label="Marcar ' + esc(i.ID) + '">' : '') + '</td>' +
+      '<td class="col-id">' + esc(i.ID) + '</td>' +
+      '<td class="col-item"><div class="item-desc">' + esc(i.Descricao) + urg + '</div>' +
+      '<div class="item-sub">' + numero(i.Quantidade) + ' ' + esc(i.Unidade) + (cs.length ? ' · ' + cs.length + (cs.length === 1 ? ' cotação' : ' cotações') : '') + '</div></td>' +
+      '<td data-rot="Cotação:">' + cotacao + '</td>' +
+      '<td class="num" data-rot="Valor:">' + (valor === null ? '—' : moeda(valor)) + '</td>' +
+      '<td>' + badge(i.Status) + '</td>' +
+      '<td class="col-acao">' + acaoRapida(i) + '</td>' +
+      '<td>' + (nMsg ? '<span class="msgs' + (novas ? ' nova' : '') + '">' + (novas ? '<span class="ponto"></span>' : '💬') + ' ' + nMsg + '</span>' : '') + '</td>' +
+      '</tr>';
+  }
+
+  /** O botão que resolve o próximo passo do item sem abrir nada. */
+  function acaoRapida(i) {
+    const temCot = cotacoesDe(i.ID).length > 0;
+    const b = (acao, rotulo, cls) => '<button class="btn ' + (cls || '') + '" type="button" data-acao="' + acao + '">' + rotulo + '</button>';
+    switch (i.Status) {
+      case 'EM_COTACAO':
+        if (!temCot) return b('cotar', '+ Cotar');
+        return souAprovador() ? b('aprovar-rapido', '✓ Aprovar', 'btn-aprovar') : b('enviar-rapido', 'Enviar p/ aprovação');
+      case 'AGUARDANDO_APROVACAO':
+        return souAprovador() ? b('aprovar-rapido', '✓ Aprovar', 'btn-aprovar') : b('cotar', '+ Cotar');
+      case 'APROVADO':
+        return b('comprado-rapido', '🛒 Comprado');
+      case 'COMPRADO':
+        return b('recebido-rapido', '📦 Recebido');
+      default:
+        return '';
+    }
+  }
+
+  function renderSelecao() {
+    const barra = $('#selecao');
+    const itens = Array.from(estado.marcados).map(id => estado.idx.itens[id]).filter(Boolean);
+    if (!itens.length) { barra.hidden = true; return; }
+    const total = itens.reduce((t, i) => t + (valorItem(i) || 0), 0);
+    barra.hidden = false;
+    barra.innerHTML = '<strong>' + itens.length + (itens.length === 1 ? ' item marcado' : ' itens marcados') + '</strong> · ' + moeda(total) +
+      '<div class="direita"><button class="btn-link" type="button" data-lote="limpar">Limpar</button>' +
+      (souAprovador()
+        ? '<button class="btn btn-aprovar" type="button" data-lote="aprovar">✓ Aprovar marcados</button>'
+        : '<button class="btn btn-primario" type="button" data-lote="enviar">Enviar marcados p/ aprovação</button>') +
+      '</div>';
+  }
+
+  function aoClicarProjetos(ev) {
+    if (estado.ocupado) return;
+    const secao = ev.target.closest('[data-projeto]');
+    if (!secao) return;
+    const nome = secao.getAttribute('data-projeto');
+    const linha = ev.target.closest('tr[data-id]');
+    const botao = ev.target.closest('[data-acao]');
+
+    if (ev.target.matches('[data-marcar-todos]')) {
+      const marcar = ev.target.checked;
+      $$('tr[data-id]', secao).forEach(tr => {
+        const item = estado.idx.itens[tr.getAttribute('data-id')];
+        if (item && podeMarcar(item)) marcar ? estado.marcados.add(item.ID) : estado.marcados.delete(item.ID);
+      });
+      return renderPainel();
+    }
+    if (ev.target.matches('[data-marcar]')) {
+      const id = linha.getAttribute('data-id');
+      ev.target.checked ? estado.marcados.add(id) : estado.marcados.delete(id);
+      return renderPainel();
+    }
+    if (ev.target.closest('select, input, a')) return;
+
+    if (botao) {
+      const acao = botao.getAttribute('data-acao');
+      const projeto = estado.dados.projetos.find(p => String(p.Nome) === nome);
+      if (acao === 'add-itens') return formLote(nome);
+      if (acao === 'encerrar') {
+        return confirmar({ titulo: 'Encerrar projeto', texto: 'Encerrar <strong>' + esc(nome) + '</strong>? Ele some da tela (marque "Encerrados" para ver de novo).', botao: 'Encerrar' })
+          .then(ok => ok && executar(api('definirProjetoAtivo', projeto.ID, false), 'Projeto encerrado.'));
+      }
+      if (acao === 'reabrir-projeto') return executar(api('definirProjetoAtivo', projeto.ID, true), 'Projeto reaberto.');
+      if (linha) return acaoDaLinha(acao, estado.idx.itens[linha.getAttribute('data-id')]);
+      return;
+    }
+    if (linha) return abrir(linha.getAttribute('data-id'));
+    if (ev.target.closest('[data-alternar]')) {
+      estado.recolhidos.has(nome) ? estado.recolhidos.delete(nome) : estado.recolhidos.add(nome);
+      gravarLocal(CHAVE_RECOLHIDOS, Array.from(estado.recolhidos));
+      secao.classList.toggle('recolhido');
+    }
+  }
+
+  function acaoDaLinha(acao, item) {
+    if (!item) return;
+    const id = item.ID;
+    switch (acao) {
+      case 'cotar': return formCotacao(item, null);
+      case 'enviar-rapido': return executar(api('enviarParaAprovacao', [id]), id + ' enviado para aprovação.');
+      case 'aprovar-rapido': {
+        const c = cotacaoAtual(item);
+        return executar(api('aprovar', [{ itemId: id, cotacaoId: c.ID }], ''), id + ' aprovado: ' + c.Fornecedor + ' · ' + moeda(c.ValorTotal));
+      }
+      case 'comprado-rapido': return executar(api('marcarComprado', id, ''), id + ' marcado como comprado.');
+      case 'recebido-rapido': return executar(api('marcarEntregue', id), id + ' recebido.');
+    }
+  }
+
+  function aoClicarSelecao(ev) {
+    const b = ev.target.closest('[data-lote]');
+    if (!b || estado.ocupado) return;
+    const tipo = b.getAttribute('data-lote');
+    const itens = Array.from(estado.marcados).map(id => estado.idx.itens[id]).filter(Boolean);
+    if (tipo === 'limpar') { estado.marcados.clear(); return renderPainel(); }
+    if (tipo === 'enviar') {
+      return executar(api('enviarParaAprovacao', itens.map(i => i.ID)), itens.length + ' item(ns) enviado(s) para aprovação.')
+        .then(() => estado.marcados.clear()).then(renderPainel).catch(() => {});
+    }
+    if (tipo === 'aprovar') {
+      const escolhas = itens.map(i => ({ itemId: i.ID, cotacaoId: cotacaoAtual(i).ID }));
+      const total = itens.reduce((t, i) => t + (valorItem(i) || 0), 0);
+      return executar(api('aprovar', escolhas, ''), itens.length + ' item(ns) aprovado(s) · ' + moeda(total))
+        .then(() => estado.marcados.clear()).then(renderPainel).catch(() => {});
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Detalhe (gaveta)
+  // ---------------------------------------------------------------------------
+
+  function abrir(id) {
+    estado.aberto = id;
+    $('#gaveta').hidden = false;
+    $('#gaveta-fundo').hidden = false;
+    document.body.style.overflow = 'hidden';
+    renderDetalhe();
+    $('#d-corpo').scrollTop = 0;
+    marcarLido(id);
+  }
+
+  function fechar() {
+    estado.aberto = null;
+    $('#gaveta').hidden = true;
+    $('#gaveta-fundo').hidden = true;
+    document.body.style.overflow = '';
+    $('#d-msg').value = '';
+  }
+
+  function marcarLido(id) {
+    const ultimas = comentariosDe(id).map(c => String(c.CriadoEm)).sort();
+    estado.dados.lidos[id] = [estado.dados.agora].concat(ultimas).sort().pop();
+    renderPainel();
+    api('marcarLido', id).catch(() => {});
+  }
+
+  function renderDetalhe() {
+    const item = estado.idx.itens[estado.aberto];
+    if (!item) { fechar(); return; }
+    const corpo = $('#d-corpo');
+    const rolagem = corpo.scrollTop;
+    $('#d-titulo').innerHTML = '<span class="col-id">' + esc(item.ID) + '</span>' + badge(item.Status);
+    corpo.innerHTML = blocoInfo(item) + blocoCotacoes(item) + blocoAcoes(item) + blocoConversa(item);
+    corpo.scrollTop = rolagem;
+  }
+
+  function blocoInfo(item) {
+    const editavel = COTAVEL.indexOf(item.Status) >= 0 && podeGerenciar(item);
+    const urg = { ALTA: 'Alta (urgente)', NORMAL: 'Normal', BAIXA: 'Baixa' }[item.Urgencia] || 'Normal';
+    return '<section class="bloco">' +
+      '<div class="bloco-topo"><div class="d-desc" style="margin:0">' + esc(item.Descricao) + '</div>' +
+      (editavel ? '<div class="acoes-topo"><button class="btn btn-sm" type="button" data-acao="editar-item">Editar</button></div>' : '') +
+      '</div>' +
+      etapas(item) +
+      '<dl class="meta" style="margin:14px 0 0">' +
+      '<div><dt>Projeto</dt><dd>' + esc(item.Projeto) + '</dd></div>' +
+      '<div><dt>Quantidade</dt><dd>' + numero(item.Quantidade) + ' ' + esc(item.Unidade) + '</dd></div>' +
+      '<div><dt>Urgência</dt><dd>' + esc(urg) + '</dd></div>' +
+      '<div><dt>Necessário até</dt><dd>' + (data(item.NecessarioAte) || '—') + '</dd></div>' +
+      '<div><dt>Solicitado por</dt><dd>' + esc(nomeDe(item.CriadoPor)) + '</dd></div>' +
+      '<div><dt>Criado em</dt><dd>' + dataHora(item.CriadoEm) + '</dd></div>' +
+      (item.Observacao ? '<div class="largo"><dt>Observação</dt><dd style="white-space:pre-wrap">' + esc(item.Observacao) + '</dd></div>' : '') +
+      '</dl>' + decisao(item) + '</section>';
+  }
+
+  function etapas(item) {
+    if (item.Status === 'CANCELADO') return '';
+    const nomes = ['Cotação', 'Aprovação', 'Compra', 'Entrega'];
+    const atual = { EM_COTACAO: 0, AGUARDANDO_APROVACAO: 1, REPROVADO: 1, APROVADO: 2, COMPRADO: 3, ENTREGUE: 4 }[item.Status];
+    return '<div class="etapas">' + nomes.map((n, i) => {
+      let cls = i < atual ? 'feita' : (i === atual ? 'atual' : '');
+      if (i === atual && item.Status === 'REPROVADO') { cls = 'atual erro'; n = 'Reprovado'; }
+      return '<div class="etapa ' + cls + '">' + n + '</div>';
+    }).join('') + '</div>';
+  }
+
+  function decisao(item) {
+    const partes = [];
+    if (APROVADOS.indexOf(item.Status) >= 0) {
+      const c = cotacoesDe(item.ID).find(x => x.ID === item.CotacaoAprovadaID);
+      partes.push('<div class="decisao ok">✓ <strong>Aprovado</strong> por ' + esc(nomeDe(item.DecididoPor)) + ' em ' + dataHora(item.DecididoEm) +
+        (c ? ' — ' + esc(c.Fornecedor) : '') + ' · <strong>' + moeda(item.ValorAprovado) + '</strong>' +
+        (item.MotivoDecisao ? '<br><em>"' + esc(item.MotivoDecisao) + '"</em>' : '') + '</div>');
+    }
+    if (item.Status === 'COMPRADO' || item.Status === 'ENTREGUE') {
+      partes.push('<div class="decisao neutra">🛒 Comprado por ' + esc(nomeDe(item.CompradoPor)) + ' em ' + dataHora(item.CompradoEm) +
+        (item.NumeroPedido ? ' · Pedido/NF: <strong>' + esc(item.NumeroPedido) + '</strong>' : '') + '</div>');
+    }
+    if (item.Status === 'ENTREGUE') {
+      partes.push('<div class="decisao ok">📦 Entregue em ' + dataHora(item.EntregueEm) + ' (confirmado por ' + esc(nomeDe(item.RecebidoPor)) + ')</div>');
+    }
+    if (item.Status === 'REPROVADO') {
+      partes.push('<div class="decisao nao">✕ <strong>Reprovado</strong> por ' + esc(nomeDe(item.DecididoPor)) + ' em ' + dataHora(item.DecididoEm) +
+        (item.MotivoDecisao ? '<br><em>"' + esc(item.MotivoDecisao) + '"</em>' : '') + '</div>');
+    }
+    if (item.Status === 'CANCELADO') {
+      const h = historicoDe(item.ID).filter(x => x.Acao === 'Cancelou').pop();
+      partes.push('<div class="decisao neutra">Cancelado' + (h ? ' por ' + esc(nomeDe(h.Usuario)) + ' em ' + dataHora(h.Data) +
+        (h.Detalhe ? '<br><em>"' + esc(h.Detalhe) + '"</em>' : '') : '') + '</div>');
+    }
+    if (item.Status === 'EM_COTACAO') {
+      const marcos = ['Criou a solicitação', 'Enviou para aprovação', 'Devolveu para cotação', 'Reabriu para nova cotação'];
+      const h = historicoDe(item.ID).filter(x => marcos.indexOf(x.Acao) >= 0).pop();
+      if (h && h.Acao === 'Devolveu para cotação') {
+        partes.push('<div class="decisao" style="background:var(--st-aguardando-bg);color:#6b4611">↩ <strong>Devolvido para cotação</strong> por ' +
+          esc(nomeDe(h.Usuario)) + ' em ' + dataHora(h.Data) + (h.Detalhe ? '<br><em>"' + esc(h.Detalhe) + '"</em>' : '') + '</div>');
+      }
+    }
+    return partes.length ? '<div style="display:flex;flex-direction:column;gap:8px;margin-top:14px">' + partes.join('') + '</div>' : '';
+  }
+
+  function podeEscolher(item) {
+    return souAprovador() && COTAVEL.indexOf(item.Status) >= 0;
+  }
+
+  function blocoCotacoes(item) {
+    const cs = cotacoesDe(item.ID);
+    const cotavel = COTAVEL.indexOf(item.Status) >= 0;
+    const escolher = podeEscolher(item) && cs.length > 1;
+    const atual = cotacaoAtual(item);
+    const menor = cs.length > 1 ? Number(cs[0].ValorTotal) : null;
+
+    const cards = cs.map(c => {
+      const aprovada = c.ID === item.CotacaoAprovadaID && APROVADOS.indexOf(item.Status) >= 0;
+      const link = linkSeguro(c.Link);
+      const minha = c.CriadoPor === eu().email || souAprovador();
+      const cls = ['cotacao'];
+      if (escolher) cls.push('escolhivel');
+      if (escolher && atual && atual.ID === c.ID) cls.push('selecionada');
+      if (aprovada) cls.push('aprovada');
+      const selos = [];
+      if (aprovada) selos.push('<span class="selo selo-aprovada">Aprovada</span>');
+      if (menor !== null && Number(c.ValorTotal) === menor) selos.push('<span class="selo selo-menor">Menor preço</span>');
+      return '<div class="' + cls.join(' ') + '" data-cot="' + esc(c.ID) + '">' +
+        (escolher ? '<input class="radio" type="radio" name="cot-' + esc(item.ID) + '"' + (atual && atual.ID === c.ID ? ' checked' : '') + ' aria-label="Escolher ' + esc(c.Fornecedor) + '">' : '') +
+        '<div class="forn">' + esc(c.Fornecedor) + '</div>' +
+        '<div class="canal">' + esc(c.Canal) +
+        (link ? ' · <a href="' + esc(link) + '" target="_blank" rel="noopener noreferrer">abrir link ↗</a>' : (c.Link ? ' · ' + esc(c.Link) : '')) + '</div>' +
+        (selos.length ? '<div class="selos">' + selos.join('') + '</div>' : '') +
+        '<div class="total">' + moeda(c.ValorTotal) + '</div>' +
+        '<div class="calc">' + numero(item.Quantidade) + ' × ' + moeda(c.ValorUnitario) +
+        (Number(c.Frete) ? ' + frete ' + moeda(c.Frete) : ' · frete grátis/incluso') + '</div>' +
+        '<div class="linha"><span>Pagamento:</span> ' + esc(c.FormaPagamento) + (c.CondicaoPagamento ? ' · ' + esc(c.CondicaoPagamento) : '') + '</div>' +
+        (c.PrazoEntrega ? '<div class="linha"><span>Entrega:</span> ' + esc(c.PrazoEntrega) + '</div>' : '') +
+        (c.Observacao ? '<div class="linha" style="white-space:pre-wrap"><span>Obs.:</span> ' + esc(c.Observacao) + '</div>' : '') +
+        '<div class="rodape">por ' + esc(nomeDe(c.CriadoPor)) + ' · ' + data(c.CriadoEm) +
+        (cotavel && minha ? '<span style="margin-left:auto"></span><button class="btn-link" type="button" data-acao="editar-cotacao">editar</button>' +
+          '<button class="btn-link" type="button" data-acao="remover-cotacao">remover</button>' : '') +
+        '</div></div>';
+    }).join('');
+
+    return '<section class="bloco"><div class="bloco-topo"><h3>Cotações (' + cs.length + ')</h3>' +
+      (cotavel ? '<div class="acoes-topo"><button class="btn btn-sm" type="button" data-acao="nova-cotacao">+ Adicionar cotação</button></div>' : '') +
+      '</div>' +
+      (escolher ? '<p class="item-sub" style="margin:-4px 0 10px">Clique numa cotação para escolher e depois em <strong>Aprovar</strong>.</p>' : '') +
+      (cs.length ? '<div class="cotacoes">' + cards + '</div>' : '<p class="item-sub" style="margin:0">Nenhuma cotação ainda.</p>') +
+      '</section>';
+  }
+
+  function blocoAcoes(item) {
+    const b = [];
+    const s = item.Status;
+    const nCot = cotacoesDe(item.ID).length;
+    if (podeEscolher(item)) {
+      b.push('<button class="btn btn-aprovar" type="button" data-acao="aprovar"' + (nCot ? '' : ' disabled') + '>✓ Aprovar cotação escolhida</button>');
+      if (s === 'AGUARDANDO_APROVACAO') b.push('<button class="btn" type="button" data-acao="devolver">↩ Devolver para cotação</button>');
+      b.push('<button class="btn btn-perigo" type="button" data-acao="reprovar">✕ Reprovar</button>');
+    } else if (s === 'EM_COTACAO') {
+      b.push('<button class="btn btn-primario" type="button" data-acao="enviar"' + (nCot ? '' : ' disabled') + '>Enviar para aprovação</button>');
+      if (!nCot) b.push('<span class="dica">Adicione ao menos uma cotação para enviar.</span>');
+    } else if (s === 'AGUARDANDO_APROVACAO') {
+      b.push('<span class="dica">Aguardando a decisão do aprovador.</span>');
+    }
+    if (s === 'APROVADO') b.push('<button class="btn btn-primario" type="button" data-acao="comprar">🛒 Marcar como comprado</button>');
+    if (s === 'COMPRADO') b.push('<button class="btn btn-primario" type="button" data-acao="entregar">📦 Confirmar entrega</button>');
+    if (s === 'REPROVADO' && podeGerenciar(item)) b.push('<button class="btn" type="button" data-acao="reabrir">Reabrir para nova cotação</button>');
+    if (['EM_COTACAO', 'AGUARDANDO_APROVACAO', 'APROVADO'].indexOf(s) >= 0 && podeGerenciar(item)) {
+      b.push('<button class="btn-link direita" type="button" data-acao="cancelar">Cancelar item</button>');
+    }
+    if (!b.length) return '';
+    return '<section class="bloco"><div class="barra-acoes">' + b.join('') + '</div></section>';
+  }
+
+  function blocoConversa(item) {
+    // Histórico primeiro: em empate de horário, o evento vem antes da mensagem.
+    const eventos = historicoDe(item.ID).map(h => ({ t: h.Data, html: evento(h) }))
+      .concat(comentariosDe(item.ID).map(c => ({ t: c.CriadoEm, html: mensagem(c) })))
+      .sort((a, b) => String(a.t).localeCompare(String(b.t)));
+    return '<section class="bloco"><div class="bloco-topo"><h3>Conversa e histórico</h3></div>' +
+      '<div class="feed">' + (eventos.length ? eventos.map(e => e.html).join('') : '<p class="item-sub">Sem mensagens.</p>') + '</div></section>';
+  }
+
+  function mensagem(c) {
+    const minha = c.Autor === eu().email;
+    return '<div class="msg' + (minha ? ' minha' : '') + '"><div class="quem">' + esc(minha ? 'Você' : nomeDe(c.Autor)) + ' · ' + dataHora(c.CriadoEm) +
+      '</div><div class="balao">' + esc(c.Texto) + '</div></div>';
+  }
+
+  function evento(h) {
+    return '<div class="evento"><b>' + esc(nomeDe(h.Usuario)) + '</b> ' + esc(h.Acao.charAt(0).toLowerCase() + h.Acao.slice(1)) +
+      ' · ' + dataHora(h.Data) + (h.Detalhe ? '<span class="det">' + esc(h.Detalhe) + '</span>' : '') + '</div>';
+  }
+
+  function aoClicarDetalhe(ev) {
+    const item = estado.idx.itens[estado.aberto];
+    if (!item || estado.ocupado) return;
+
+    const card = ev.target.closest('.cotacao');
+    const botao = ev.target.closest('[data-acao]');
+    if (card && !botao && !ev.target.closest('a') && podeEscolher(item)) {
+      estado.selecionada[item.ID] = card.getAttribute('data-cot');
+      renderDetalhe();
+      renderPainel();
+      return;
+    }
+    if (!botao) return;
+    const acao = botao.getAttribute('data-acao');
+    const cot = card ? cotacoesDe(item.ID).find(c => c.ID === card.getAttribute('data-cot')) : null;
+    const id = item.ID;
+
+    switch (acao) {
+      case 'editar-item': return formItem(item);
+      case 'nova-cotacao': return formCotacao(item, null);
+      case 'editar-cotacao': return formCotacao(item, cot);
+      case 'remover-cotacao':
+        return confirmar({ titulo: 'Remover cotação', texto: 'Remover a cotação de ' + esc(cot.Fornecedor) + ' (' + moeda(cot.ValorTotal) + ')?', botao: 'Remover', perigo: true })
+          .then(ok => ok && executar(api('removerCotacao', id, cot.ID), 'Cotação removida.'));
+      case 'enviar':
+        return executar(api('enviarParaAprovacao', [id]), 'Enviado para aprovação.');
+      case 'aprovar': {
+        const c = cotacaoAtual(item);
+        return pedirTexto({
+          titulo: 'Aprovar compra',
+          texto: '<strong>' + esc(item.Descricao) + '</strong><br>' + esc(c.Fornecedor) + ' · <strong>' + moeda(c.ValorTotal) + '</strong><br>' +
+            esc(c.FormaPagamento) + (c.CondicaoPagamento ? ' · ' + esc(c.CondicaoPagamento) : ''),
+          rotulo: 'Observação para quem vai comprar (opcional)',
+          botao: '✓ Aprovar',
+        }).then(obs => obs !== null && executar(api('aprovar', [{ itemId: id, cotacaoId: c.ID }], obs), 'Compra aprovada.'));
+      }
+      case 'devolver':
+        return pedirTexto({ titulo: 'Devolver para cotação', rotulo: 'O que precisa mudar? (ex.: cotar mais 2 fornecedores, ver parcelamento)', obrigatorio: true, botao: 'Devolver' })
+          .then(m => m !== null && executar(api('devolverParaCotacao', id, m), 'Devolvido para cotação.'));
+      case 'reprovar':
+        return pedirTexto({ titulo: 'Reprovar item', rotulo: 'Motivo da reprovação', obrigatorio: true, botao: 'Reprovar', perigo: true })
+          .then(m => m !== null && executar(api('reprovar', id, m), 'Item reprovado.'));
+      case 'comprar':
+        return pedirTexto({ titulo: 'Marcar como comprado', rotulo: 'Nº do pedido ou da nota fiscal (opcional)', linha: true, botao: 'Confirmar compra' })
+          .then(n => n !== null && executar(api('marcarComprado', id, n), 'Marcado como comprado.'));
+      case 'entregar':
+        return executar(api('marcarEntregue', id), 'Entrega confirmada.');
+      case 'reabrir':
+        return executar(api('reabrir', id), 'Reaberto para cotação.');
+      case 'cancelar':
+        return pedirTexto({ titulo: 'Cancelar item', rotulo: 'Motivo do cancelamento', obrigatorio: true, botao: 'Cancelar item', perigo: true })
+          .then(m => m !== null && executar(api('cancelar', id, m), 'Item cancelado.'));
+    }
+  }
+
+  function enviarMensagem(ev) {
+    ev.preventDefault();
+    const campo = $('#d-msg');
+    const texto = campo.value.trim();
+    if (!texto || !estado.aberto || estado.ocupado) return;
+    executar(api('comentar', estado.aberto, texto)).then(() => {
+      campo.value = '';
+      ajustarAltura(campo);
+      const corpo = $('#d-corpo');
+      corpo.scrollTop = corpo.scrollHeight;
+    }).catch(() => {});
+  }
+
+  function ajustarAltura(t) {
+    t.style.height = 'auto';
+    t.style.height = Math.min(t.scrollHeight + 2, 140) + 'px';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Modais
+  // ---------------------------------------------------------------------------
+
+  let aoFecharModal = null;
+
+  function abrirModal(titulo, corpo, rodape, opcoesModal) {
+    const modal = $('#modal');
+    modal.className = 'modal' + (opcoesModal && opcoesModal.largura ? ' ' + opcoesModal.largura : '');
+    modal.innerHTML = '<div class="modal-topo"><h2>' + esc(titulo) + '</h2><button class="btn-icone" type="button" data-fechar aria-label="Fechar">✕</button></div>' +
+      '<div class="modal-corpo"><div class="erro-form" hidden></div>' + corpo + '</div>' +
+      '<div class="modal-rodape">' + rodape + '</div>';
+    $('#modal-fundo').hidden = false;
+    const primeiro = $('input:not([type=hidden]), select, textarea', modal);
+    if (primeiro) setTimeout(() => primeiro.focus(), 30);
+    return modal;
+  }
+
+  function fecharModal(resultado) {
+    $('#modal-fundo').hidden = true;
+    $('#modal').innerHTML = '';
+    const cb = aoFecharModal;
+    aoFecharModal = null;
+    if (cb) cb(resultado);
+  }
+
+  function erroModal(msg) {
+    const el = $('#modal .erro-form');
+    if (!el) return toast(msg, 'erro');
+    el.textContent = msg;
+    el.style.whiteSpace = 'pre-line';
+    el.hidden = !msg;
+    if (msg) el.scrollIntoView({ block: 'nearest' });
+  }
+
+  /** Resolve com o texto digitado, ou null se cancelar. */
+  function pedirTexto(o) {
+    return new Promise(resolve => {
+      const campo = o.rotulo
+        ? '<label><span class="rot">' + esc(o.rotulo) + (o.obrigatorio ? ' <i>*</i>' : '') + '</span>' +
+          (o.linha ? '<input class="campo" id="m-texto">' : '<textarea class="campo" id="m-texto" rows="3"></textarea>') + '</label>'
+        : '';
+      const modal = abrirModal(o.titulo, (o.texto ? '<p style="margin:0">' + o.texto + '</p>' : '') + campo,
+        '<button class="btn" type="button" data-fechar>Voltar</button>' +
+        '<button class="btn ' + (o.perigo ? 'btn-perigo' : 'btn-primario') + '" type="button" data-ok>' + esc(o.botao || 'OK') + '</button>',
+        { largura: 'estreito' });
+      aoFecharModal = resolve;
+      $('[data-ok]', modal).addEventListener('click', () => {
+        const t = o.rotulo ? $('#m-texto').value.trim() : '';
+        if (o.obrigatorio && !t) return erroModal('Preencha o campo para continuar.');
+        fecharModal(t);
+      });
+      const input = $('#m-texto');
+      if (input) input.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && (o.linha || e.ctrlKey || e.metaKey)) { e.preventDefault(); $('[data-ok]', modal).click(); }
+      });
+    }).then(v => (v === undefined ? null : v));
+  }
+
+  function confirmar(o) {
+    return pedirTexto({ titulo: o.titulo, texto: o.texto, botao: o.botao, perigo: o.perigo }).then(v => v !== null);
+  }
+
+  // ----- Novo projeto -----
+
+  function formProjeto() {
+    const modal = abrirModal('Novo projeto',
+      '<div class="grade">' +
+      '<label class="s4"><span class="rot">Nome do projeto <i>*</i></span><input class="campo" id="m-pj-nome" placeholder="Ex.: Datacenter Hospital Santa Clara"></label>' +
+      '<label class="s2"><span class="rot">Cliente</span><input class="campo" id="m-pj-cliente"></label></div>',
+      '<button class="btn" type="button" data-fechar>Cancelar</button><button class="btn btn-primario" type="button" data-ok>Criar e lançar itens</button>',
+      { largura: 'estreito' });
+    const salvar = () => {
+      const nome = $('#m-pj-nome').value.trim();
+      if (!nome) return erroModal('Informe o nome do projeto.');
+      executar(api('criarProjeto', nome, $('#m-pj-cliente').value.trim()), 'Projeto criado.')
+        .then(d => { fecharModal(); formLote(d.retorno); })
+        .catch(e => erroModal(e.message));
+    };
+    $('[data-ok]', modal).addEventListener('click', salvar);
+    $$('input', modal).forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') salvar(); }));
+  }
+
+  // ----- Lançar vários itens de uma vez -----
+
+  function linhaLote() {
+    return '<tr>' +
+      '<td class="n"></td>' +
+      '<td style="width:40%"><input class="campo" data-c="descricao" placeholder="Descrição do item"></td>' +
+      '<td style="width:80px"><input class="campo" data-c="quantidade" inputmode="decimal" placeholder="Qtd"></td>' +
+      '<td style="width:80px"><input class="campo" data-c="unidade" list="m-unidades" value="un"></td>' +
+      '<td style="width:110px"><select class="campo" data-c="urgencia"><option value="NORMAL">Normal</option><option value="ALTA">Urgente</option><option value="BAIXA">Baixa</option></select></td>' +
+      '<td><input class="campo" data-c="observacao" placeholder="Obs. (opcional)"></td>' +
+      '<td style="width:28px"><button class="btn-icone" type="button" data-tirar aria-label="Remover linha">✕</button></td>' +
+      '</tr>';
+  }
+
+  function formLote(projeto) {
+    const modal = abrirModal('Lançar itens — ' + projeto,
+      '<p class="item-sub" style="margin:0">Uma linha por item. Dá para <strong>colar do Excel</strong> (colunas: descrição, quantidade, unidade). Linhas vazias são ignoradas.</p>' +
+      '<div class="lote-wrap"><table class="lote"><thead><tr><th></th><th>Descrição <i style="color:var(--perigo);font-style:normal">*</i></th><th>Qtd <i style="color:var(--perigo);font-style:normal">*</i></th><th>Unid.</th><th>Urgência</th><th>Observação</th><th></th></tr></thead>' +
+      '<tbody id="m-lote">' + linhaLote() + linhaLote() + linhaLote() + '</tbody></table></div>' +
+      '<datalist id="m-unidades">' + UNIDADES.map(u => '<option value="' + esc(u) + '">').join('') + '</datalist>' +
+      '<div><button class="btn btn-sm" type="button" id="m-mais">+ Mais linhas</button></div>',
+      '<button class="btn" type="button" data-fechar>Cancelar</button><button class="btn btn-primario" type="button" data-ok>Salvar itens</button>',
+      { largura: 'largo' });
+    const corpo = $('#m-lote', modal);
+    const numerar = () => $$('tr', corpo).forEach((tr, k) => { $('.n', tr).textContent = k + 1; });
+    numerar();
+
+    $('#m-mais', modal).addEventListener('click', () => {
+      corpo.insertAdjacentHTML('beforeend', linhaLote() + linhaLote() + linhaLote());
+      numerar();
+    });
+    corpo.addEventListener('click', e => {
+      if (!e.target.closest('[data-tirar]')) return;
+      if ($$('tr', corpo).length > 1) e.target.closest('tr').remove();
+      numerar();
+    });
+    // Colar várias linhas/colunas (Excel, Planilhas) a partir da célula clicada.
+    corpo.addEventListener('paste', e => {
+      const texto = (e.clipboardData || window.clipboardData).getData('text');
+      if (!/[\t\n]/.test(texto.trim())) return;
+      e.preventDefault();
+      const colunas = ['descricao', 'quantidade', 'unidade', 'urgencia', 'observacao'];
+      const inicioCol = Math.max(0, colunas.indexOf(e.target.getAttribute('data-c')));
+      let tr = e.target.closest('tr');
+      texto.replace(/\r/g, '').split('\n').filter(l => l.trim()).forEach(l => {
+        if (!tr) { corpo.insertAdjacentHTML('beforeend', linhaLote()); tr = corpo.lastElementChild; }
+        l.split('\t').forEach((v, k) => {
+          const c = colunas[inicioCol + k];
+          const el = c && c !== 'urgencia' && $('[data-c="' + c + '"]', tr);
+          if (el) el.value = v.trim();
+        });
+        tr = tr.nextElementSibling;
+      });
+      numerar();
+    });
+
+    $('[data-ok]', modal).addEventListener('click', () => {
+      const itens = [];
+      const linhas = $$('tr', corpo);
+      for (let k = 0; k < linhas.length; k++) {
+        const v = c => $('[data-c="' + c + '"]', linhas[k]).value.trim();
+        if (!v('descricao') && !v('quantidade') && !v('observacao')) continue;
+        const qtd = lerValor(v('quantidade'));
+        if (!v('descricao')) return erroModal('Linha ' + (k + 1) + ': falta a descrição.');
+        if (!(qtd > 0)) return erroModal('Linha ' + (k + 1) + ': quantidade inválida.');
+        itens.push({ descricao: v('descricao'), quantidade: qtd, unidade: v('unidade'), urgencia: v('urgencia'), observacao: v('observacao') });
+      }
+      if (!itens.length) return erroModal('Preencha pelo menos um item.');
+      estado.recolhidos.delete(projeto);
+      gravarLocal(CHAVE_RECOLHIDOS, Array.from(estado.recolhidos));
+      executar(api('criarItens', projeto, itens), itens.length + (itens.length === 1 ? ' item lançado.' : ' itens lançados.') + ' Agora é só cotar.')
+        .then(() => fecharModal())
+        .catch(e => erroModal(e.message));
+    });
+  }
+
+  // ----- Cotação -----
+
+  function camposCotacao(c) {
+    c = c || {};
+    return '<div class="grade">' +
+      '<label class="s3"><span class="rot">Fornecedor <i>*</i></span><input class="campo" data-campo="fornecedor" value="' + esc(c.Fornecedor) + '" placeholder="Ex.: Kalunga, Leroy, Distribuidora X"></label>' +
+      '<label class="s3"><span class="rot">Onde foi cotado <i>*</i></span><select class="campo" data-campo="canal">' + opcoes(CANAIS, c.Canal, 'Selecione…') + '</select></label>' +
+      '<label><span class="rot">Link do produto / orçamento</span><input class="campo" data-campo="link" value="' + esc(c.Link) + '" placeholder="https://…"></label>' +
+      '<label class="s2 m3"><span class="rot">Valor unitário (R$) <i>*</i></span><input class="campo" data-campo="valorUnitario" inputmode="decimal" value="' + esc(valorParaInput(c.ValorUnitario)) + '" placeholder="0,00"></label>' +
+      '<label class="s2 m3"><span class="rot">Frete (R$)</span><input class="campo" data-campo="frete" inputmode="decimal" value="' + esc(valorParaInput(c.Frete)) + '" placeholder="0,00"></label>' +
+      '<label class="s2"><span class="rot">Prazo de entrega</span><input class="campo" data-campo="prazoEntrega" value="' + esc(c.PrazoEntrega) + '" placeholder="Ex.: 5 dias úteis"></label>' +
+      '<label class="s3"><span class="rot">Forma de pagamento <i>*</i></span><select class="campo" data-campo="formaPagamento">' + opcoes(PAGAMENTOS, c.FormaPagamento, 'Selecione…') + '</select></label>' +
+      '<label class="s3"><span class="rot">Condição</span><input class="campo" data-campo="condicaoPagamento" value="' + esc(c.CondicaoPagamento) + '" placeholder="À vista, 3x sem juros, 28 dias…"></label>' +
+      '<label><span class="rot">Observação</span><input class="campo" data-campo="observacao" value="' + esc(c.Observacao) + '" placeholder="Marca, modelo, garantia, validade da proposta…"></label>' +
+      '</div><div class="total-previa" data-previa></div>';
+  }
+
+  function lerCotacao(raiz) {
+    const v = campo => { const el = $('[data-campo="' + campo + '"]', raiz); return el ? el.value.trim() : ''; };
+    return {
+      fornecedor: v('fornecedor'),
+      canal: v('canal'),
+      link: v('link'),
+      valorUnitario: lerValor(v('valorUnitario')),
+      frete: v('frete') ? lerValor(v('frete')) : 0,
+      formaPagamento: v('formaPagamento'),
+      condicaoPagamento: v('condicaoPagamento'),
+      prazoEntrega: v('prazoEntrega'),
+      observacao: v('observacao'),
+    };
+  }
+
+  function validarCotacao(c) {
+    if (!c.fornecedor) return 'Informe o fornecedor.';
+    if (!c.canal) return 'Informe onde foi cotado.';
+    if (!(c.valorUnitario > 0)) return 'Informe um valor unitário válido.';
+    if (!(c.frete >= 0)) return 'Frete inválido.';
+    if (!c.formaPagamento) return 'Informe a forma de pagamento.';
+    return '';
+  }
+
+  function atualizarPrevia(raiz, quantidade) {
+    const c = lerCotacao(raiz);
+    const el = $('[data-previa]', raiz);
+    if (c.valorUnitario > 0 && quantidade > 0) {
+      const total = c.valorUnitario * quantidade + (c.frete > 0 ? c.frete : 0);
+      el.innerHTML = 'Total: <b>' + moeda(total) + '</b> (' + numero(quantidade) + ' × ' + moeda(c.valorUnitario) + (c.frete > 0 ? ' + frete ' + moeda(c.frete) : '') + ')';
+    } else {
+      el.textContent = '';
+    }
+  }
+
+  /** Cotação nova ou edição. Na nova, "Salvar e outra" mantém o modal aberto para a próxima. */
+  function formCotacao(item, cot) {
+    const qtd = Number(item.Quantidade);
+    const n = cotacoesDe(item.ID).length;
+    const modal = abrirModal(cot ? 'Editar cotação' : 'Nova cotação',
+      '<p class="item-sub" style="margin:0"><strong>' + esc(item.ID) + '</strong> · ' + esc(item.Descricao) + ' · ' + numero(qtd) + ' ' + esc(item.Unidade) +
+      (!cot && n ? ' · já tem ' + n + (n === 1 ? ' cotação' : ' cotações') : '') + '</p>' +
+      '<div id="m-cot">' + camposCotacao(cot) + '</div>',
+      '<button class="btn" type="button" data-fechar>Cancelar</button>' +
+      (cot ? '' : '<button class="btn" type="button" data-ok="outra">Salvar e adicionar outra</button>') +
+      '<button class="btn btn-primario" type="button" data-ok="fechar">Salvar cotação</button>');
+    const raiz = $('#m-cot', modal);
+    raiz.addEventListener('input', () => atualizarPrevia(raiz, qtd));
+    atualizarPrevia(raiz, qtd);
+    $$('[data-ok]', modal).forEach(bt => bt.addEventListener('click', () => {
+      const c = lerCotacao(raiz);
+      const erro = validarCotacao(c);
+      if (erro) return erroModal(erro);
+      if (cot) c.id = cot.ID;
+      const outra = bt.getAttribute('data-ok') === 'outra';
+      executar(api('salvarCotacao', item.ID, c), cot ? 'Cotação atualizada.' : 'Cotação de ' + c.fornecedor + ' salva.')
+        .then(() => {
+          fecharModal();
+          if (outra) formCotacao(estado.idx.itens[item.ID] || item, null);
+        })
+        .catch(e => erroModal(e.message));
+    }));
+  }
+
+  // ----- Editar item -----
+
+  function formItem(i) {
+    const projetos = listaProjetos().filter(p => p.Ativo || String(p.Nome) === i.Projeto).map(p => String(p.Nome))
+      .sort((a, b) => a.localeCompare(b, 'pt-BR'));
+    const modal = abrirModal('Editar ' + i.ID,
+      '<div class="grade">' +
+      '<label class="s4"><span class="rot">Projeto <i>*</i></span><select class="campo" id="m-projeto">' + opcoes(projetos, i.Projeto) + '</select></label>' +
+      '<label class="s2"><span class="rot">Urgência</span><select class="campo" id="m-urgencia">' +
+      [['NORMAL', 'Normal'], ['ALTA', 'Alta (urgente)'], ['BAIXA', 'Baixa']].map(o => '<option value="' + o[0] + '"' + (o[0] === (i.Urgencia || 'NORMAL') ? ' selected' : '') + '>' + o[1] + '</option>').join('') +
+      '</select></label>' +
+      '<label><span class="rot">Descrição <i>*</i></span><input class="campo" id="m-descricao" value="' + esc(i.Descricao) + '"></label>' +
+      '<label class="s2 m3"><span class="rot">Quantidade <i>*</i></span><input class="campo" id="m-quantidade" inputmode="decimal" value="' + esc(valorParaInput(i.Quantidade)) + '"></label>' +
+      '<label class="s2 m3"><span class="rot">Unidade</span><input class="campo" id="m-unidade" list="m-unidades" value="' + esc(i.Unidade || 'un') + '"></label>' +
+      '<datalist id="m-unidades">' + UNIDADES.map(u => '<option value="' + esc(u) + '">').join('') + '</datalist>' +
+      '<label class="s2"><span class="rot">Necessário até</span><input class="campo" id="m-necessario" type="date" value="' + paraInputData(i.NecessarioAte) + '"></label>' +
+      '<label><span class="rot">Observação / especificação</span><textarea class="campo" id="m-obs" rows="2">' + esc(i.Observacao) + '</textarea></label>' +
+      '</div>',
+      '<button class="btn" type="button" data-fechar>Cancelar</button><button class="btn btn-primario" type="button" data-ok>Salvar alterações</button>');
+    $('[data-ok]', modal).addEventListener('click', () => {
+      const dados = {
+        projeto: $('#m-projeto').value,
+        descricao: $('#m-descricao').value.trim(),
+        quantidade: lerValor($('#m-quantidade').value),
+        unidade: $('#m-unidade').value.trim(),
+        urgencia: $('#m-urgencia').value,
+        necessarioAte: $('#m-necessario').value,
+        observacao: $('#m-obs').value.trim(),
+      };
+      if (!dados.descricao) return erroModal('Descreva o item.');
+      if (!(dados.quantidade > 0)) return erroModal('Informe uma quantidade maior que zero.');
+      executar(api('editarItem', i.ID, dados), 'Item atualizado.').then(() => fecharModal()).catch(e => erroModal(e.message));
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Inicialização
+  // ---------------------------------------------------------------------------
+
+  function ligarEventos() {
+    $('#btn-novo-projeto').addEventListener('click', formProjeto);
+    $('#projetos').addEventListener('click', aoClicarProjetos);
+    $('#projetos').addEventListener('change', e => {
+      if (!e.target.matches('[data-escolher]')) return;
+      estado.selecionada[e.target.closest('tr').getAttribute('data-id')] = e.target.value;
+      renderPainel();
+    });
+    $('#selecao').addEventListener('click', aoClicarSelecao);
+    $('#aviso').addEventListener('click', e => {
+      const b = e.target.closest('[data-ir]');
+      if (!b) return;
+      estado.filtro.status = b.getAttribute('data-ir');
+      renderPainel();
+    });
+    $('#f-busca').addEventListener('input', e => { estado.filtro.busca = e.target.value; renderPainel(); });
+    $('#f-status').addEventListener('change', e => { estado.filtro.status = e.target.value; renderPainel(); });
+    $('#f-encerrados').addEventListener('change', e => { estado.filtro.encerrados = e.target.checked; renderPainel(); });
+
+    $('#d-fechar').addEventListener('click', fechar);
+    $('#gaveta-fundo').addEventListener('click', fechar);
+    $('#d-corpo').addEventListener('click', aoClicarDetalhe);
+    $('#d-chat').addEventListener('submit', enviarMensagem);
+    const msg = $('#d-msg');
+    msg.addEventListener('input', () => ajustarAltura(msg));
+    msg.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) enviarMensagem(e);
+    });
+
+    $('#modal').addEventListener('click', e => { if (e.target.closest('[data-fechar]')) fecharModal(); });
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape') return;
+      if (!$('#modal-fundo').hidden) fecharModal();
+      else if (estado.aberto) fechar();
+    });
+  }
+
+  function atualizarEmSegundoPlano() {
+    if (document.hidden || estado.ocupado || !estado.dados || !$('#modal-fundo').hidden) return;
+    api('getDados').then(d => {
+      if (estado.ocupado || !$('#modal-fundo').hidden) return;
+      aplicar(d);
+      if (estado.aberto && naoLidas(estado.idx.itens[estado.aberto] || {}) > 0) marcarLido(estado.aberto);
+    }).catch(() => {});
+  }
+
+  function iniciar() {
+    ligarEventos();
+    api('getInicial').then(d => {
+      $('#carregando').hidden = true;
+      if (d.semAcesso) {
+        $('#sem-acesso-email').textContent = d.email;
+        $('#sem-acesso').hidden = false;
+        return;
+      }
+      $('#painel').hidden = false;
+      aplicar(d);
+      setInterval(atualizarEmSegundoPlano, ATUALIZAR_A_CADA_MS);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) atualizarEmSegundoPlano(); });
+    }).catch(e => {
+      $('#carregando').innerHTML = '<div class="sem-acesso"><h1>Não foi possível carregar</h1><p>' + esc(e.message) + '</p></div>';
+    });
+  }
+
+  iniciar();
+})();
+</script>

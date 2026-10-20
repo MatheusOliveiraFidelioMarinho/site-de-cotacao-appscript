@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= include('Estilos'); ?>
+</head>
+<body>
+  <header class="topo">
+    <div class="topo-in">
+      <img class="logo" src="<?!= include('Logo'); ?>" alt="A+.com Engenharia e Tecnologia">
+      <span class="topo-titulo">Compras</span>
+      <div class="topo-dir">
+        <div id="usuario" class="usuario"></div>
+      </div>
+    </div>
+  </header>
+
+  <main class="conteudo">
+    <div id="carregando" class="carregando"><span class="spinner"></span> Carregando…</div>
+
+    <section id="sem-acesso" class="sem-acesso" hidden>
+      <h1>Acesso não liberado</h1>
+      <p>Sua conta <strong id="sem-acesso-email"></strong> ainda não está cadastrada no sistema de compras.</p>
+      <p>Peça para quem administra a planilha adicionar esse e-mail na aba <strong>Usuarios</strong> e recarregue a página.</p>
+    </section>
+
+    <!-- Tela única: projetos com seus itens -->
+    <section id="painel" hidden>
+      <div id="aviso"></div>
+      <div class="cab-vista">
+        <h1>Compras por projeto</h1>
+        <div class="cab-acoes">
+          <input id="f-busca" class="campo" type="search" placeholder="Buscar projeto, item, fornecedor…">
+          <select id="f-status" class="campo campo-curto"></select>
+          <label class="check"><input id="f-encerrados" type="checkbox"> Encerrados</label>
+          <button id="btn-novo-projeto" class="btn btn-primario" type="button">+ Novo projeto</button>
+        </div>
+      </div>
+      <div id="selecao" class="barra-selecao" hidden></div>
+      <div id="projetos" class="projetos"></div>
+    </section>
+  </main>
+
+  <div id="gaveta-fundo" class="gaveta-fundo" hidden></div>
+  <aside id="gaveta" class="gaveta" hidden aria-label="Detalhes do item">
+    <div class="gaveta-topo">
+      <div id="d-titulo" class="d-titulo"></div>
+      <button id="d-fechar" class="btn-icone" type="button" aria-label="Fechar">✕</button>
+    </div>
+    <div id="d-corpo" class="gaveta-corpo"></div>
+    <form id="d-chat" class="chat-form">
+      <textarea id="d-msg" class="campo" rows="1" placeholder="Escreva uma mensagem… (Ctrl+Enter envia)"></textarea>
+      <button class="btn btn-primario" type="submit">Enviar</button>
+    </form>
+  </aside>
+
+  <div id="modal-fundo" class="modal-fundo" hidden>
+    <div id="modal" class="modal" role="dialog" aria-modal="true"></div>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+
+  <?!= include('App'); ?>
+</body>
+</html>
