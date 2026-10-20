@@ -1,0 +1,7 @@
+# Dados da empresa: não vão para o repositório
+tabela.xlsx
+*.xlsx
+apps-script/Importacao.gs
+
+node_modules/
+.clasp.json
